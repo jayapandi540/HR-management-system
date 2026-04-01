@@ -1,0 +1,116 @@
+{
+  "_comment": "Gatekeeper rejection rules for doc_pipeline. Each rule has: detect[], condition (optional), threshold (optional), action.",
+
+  "layout_rejection_rules": {
+    "multi_column_layout": {
+      "detect": ["irregular_line_order", "overlapping_text_blocks", "x_axis_jump"],
+      "description": "Text blocks that do not flow top-to-bottom in a single column — typically two-column or three-column resume layouts. Detected by y-position not monotonically increasing and large horizontal x_offset jumps between consecutive blocks.",
+      "action": "reject_section",
+      "signals": {
+        "x_axis_jump_threshold_px": 200,
+        "y_regression_tolerance_px": 10
+      }
+    },
+    "tables_and_textboxes": {
+      "detect": ["grid_structure", "cell_alignment_pattern", "boxed_text"],
+      "description": "Grid or table-like structures. Docling marks these as TableBlock. Content inside cells is often skill meters or visual ratings — ignored without context.",
+      "action": "ignore_content"
+    },
+    "complex_shapes": {
+      "detect": ["non_text_elements", "vector_shapes", "drawing_objects"],
+      "description": "SVG paths, decorative dividers, geometric backgrounds. No extractable text.",
+      "action": "ignore"
+    },
+    "background_graphics": {
+      "detect": ["low_contrast_text", "watermark_pattern", "overlay_noise"],
+      "description": "Text rendered over a busy background — OCR confidence will be low and content unreliable.",
+      "action": "reject"
+    },
+    "headers_footers": {
+      "detect": ["repeated_lines", "page_numbers", "duplicate_blocks"],
+      "description": "Lines that appear identically on every page (headers/footers, page numbers). Deduplicated across pages.",
+      "action": "deduplicate_or_ignore"
+    }
+  },
+
+  "visual_rejection_rules": {
+    "icons_without_text": {
+      "detect": ["icon_only", "no_adjacent_text"],
+      "description": "Small image elements (social icons, checkmarks, bullets as images) with no readable text adjacent. Carry no semantic value.",
+      "action": "reject"
+    },
+    "skill_meters": {
+      "detect": ["ring", "circle", "star", "bar", "progress_indicator"],
+      "condition": "no_text_context",
+      "description": "Graphical skill level indicators (star ratings, ring charts, bar meters). Rejected unless adjacent plain text provides a numeric or label equivalent that can be normalised.",
+      "action": "reject",
+      "note": "If text label 'Python - Expert' exists beside the bar → text is kept; bar is ignored."
+    },
+    "image_only_elements": {
+      "detect": ["image_block", "logo", "badge", "photo"],
+      "condition": "no_ocr_text",
+      "description": "Company logos, candidate photos, certification badge images. No extractable text.",
+      "action": "ignore"
+    }
+  },
+
+  "content_rejection_rules": {
+    "generic_phrases": {
+      "detect": [
+        "hardworking", "passionate", "enthusiastic", "self-motivated",
+        "team player", "go-getter", "results-driven", "dynamic",
+        "detail-oriented", "proactive", "fast learner"
+      ],
+      "condition": "no_supporting_context",
+      "description": "Filler adjectives with no concrete supporting evidence in the same sentence or paragraph.",
+      "action": "reject",
+      "note": "'Passionate about machine learning — 3 Kaggle top-10 finishes' is accepted because evidence exists."
+    },
+    "keyword_stuffing": {
+      "detect": ["long_keyword_list", "comma_separated_skills", "no_structure"],
+      "description": "More than 25 skills listed in a flat comma-separated block with no context, grouping, or experience mapping.",
+      "threshold": 25,
+      "action": "reject"
+    },
+    "boilerplate_text": {
+      "detect": ["legal_disclaimer", "privacy_notice", "template_text", "confidentiality_notice"],
+      "position": ["top", "bottom"],
+      "description": "GDPR/privacy notices, 'This resume is confidential', or template placeholder text.",
+      "action": "ignore"
+    },
+    "empty_sections": {
+      "detect": ["section_header_no_content"],
+      "description": "A section heading (e.g. 'AWARDS') followed by no content or only whitespace.",
+      "action": "ignore"
+    }
+  },
+
+  "source_quality_rules": {
+    "low_quality_ocr": {
+      "detect": ["low_confidence_score", "broken_words", "random_characters"],
+      "threshold": 0.6,
+      "description": "PaddleOCR confidence per word below 0.60. Broken words like 'E X P E R I E N C E' or random symbols.",
+      "action": "reject_section"
+    },
+    "scanned_resume_only": {
+      "detect": ["no_text_layer", "image_only_pdf"],
+      "description": "PDF has no selectable text layer at all — pure scan. Route entire document to PaddleOCR.",
+      "action": "flag_for_ocr_only"
+    },
+    "non_text_layers": {
+      "detect": ["background_pdf_layer", "vector_noise", "glyph_errors"],
+      "description": "PDFs with glyph encoding errors (Private Use Area codepoints > U+E000) or garbled characters exceeding 30% of page text.",
+      "action": "clean_or_reject",
+      "garble_threshold": 0.30
+    }
+  },
+
+  "signal_definitions": {
+    "irregular_line_order": "y_position of consecutive text blocks is not monotonically increasing (regression > 10 px)",
+    "x_axis_jump":          "horizontal offset between consecutive blocks exceeds 200 px in a single-column context",
+    "repeated_lines":       "identical text string appears on 2+ pages at the same y-offset",
+    "broken_words":         "token matches regex [A-Z]\\s[A-Z]\\s[A-Z] (spaced-out letters)",
+    "random_characters":    "token contains >40% non-alphanumeric characters excluding punctuation",
+    "low_confidence_score": "PaddleOCR word-level confidence < threshold (default 0.60)"
+  }
+}
