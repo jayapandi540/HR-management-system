@@ -48,11 +48,11 @@ curl -F "resume=@test.pdf" -F "jd=@job.txt" http://localhost:8000/api/match
 ## Tech
 - **Backend**: FastAPI/Pydantic/SQLAlchemy
 - **ML**: scikit-learn/XGBoost
-- **Infra**: Redis/DuckDB/Chroma/Prometheus [linkedin](https://www.linkedin.com/posts/arvami-solutionz_the-queue-mode-architecture-activity-7430249828397293568-vGDz)
+- **Infra**: Redis/DuckDB/Chroma/Prometheus
 
 ## Testing
 - Unit: parsers/scorers
 - Integration: queue flows
-- Model: F1/rank eval on labeled data [47billion](https://47billion.com/blog/rethinking-resume-scoring-how-llms-are-transforming-ats-for-the-ai-generation/)
+- Model: F1/rank eval on labeled data 
 
 
