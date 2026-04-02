@@ -1,431 +1,382 @@
 """
 doc_pipeline/parse_pipeline/gatekeeper/gatekeeper.py
 =====================================================
-Layer 3 — Gatekeeper: rule-based filter on ingested pages.
+Gatekeeper — applies all 4 rule categories from rejection_rules.json.
 
-Reads rules from rejection_rules.json.
-Produces GatekeeperResult: which blocks to reject/ignore/flag/dedup.
+Flow per page:
+  ingest_blocks → pages_to_sections() → compute_signals() → apply_rules()
 
-Exported output shape (per spec):
-{
-  "rejected_elements": [
-    {
-      "type": "layout | visual | content | source",
-      "reason": "rule_triggered",
-      "action": "ignored | rejected | flagged"
-    }
-  ]
-}
+Rule categories (matching JSON spec exactly):
+  layout_rejection_rules   → multi-column, tables, shapes, backgrounds, headers/footers
+  visual_rejection_rules   → icons, skill meters, image-only elements
+  content_rejection_rules  → generic phrases, keyword stuffing, boilerplate
+  source_quality_rules     → low OCR confidence, scanned-only, glyph errors
 
-Exports:
-  pages_to_sections(pages)          → dict[str, list[IngestedBlock]]
-  compute_signals(page)             → LayoutSignals
-  apply_rules(pages, rules)         → GatekeeperResult
+Outputs per block:
+  GatekeeperRuleHit list + cleaned text (or empty string if rejected)
 """
+
 from __future__ import annotations
 
+import json
+import math
 import re
-import logging
-from collections import defaultdict
+import unicodedata
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
 
-from ..config     import REJECTION_RULES, OCR_CONFIDENCE_THRESHOLD
-from ..interfaces import (
-    GatekeeperAction, GatekeeperResult, GatekeeperRuleHit,
-    IngestedBlock, IngestedPage, LayoutSignals,
+from doc_pipeline.parse_pipeline.interfaces import GatekeeperRuleHit, PageSignals
+from shared.constants import RuleAction, RuleCategory
+
+# Load rules once at import time
+_RULES_PATH = Path(__file__).parent.parent / "rules" / "rejection_rules.json"
+_RULES: dict = json.loads(_RULES_PATH.read_text(encoding="utf-8"))
+_THRESHOLDS: dict = _RULES.get("global_thresholds", {})
+
+OCR_MIN_CONF   = _THRESHOLDS.get("ocr_min_confidence", 0.6)
+GARBLE_MAX     = _THRESHOLDS.get("garble_ratio_max", 0.30)
+MIN_TEXT_CHARS = _THRESHOLDS.get("min_text_chars_page", 20)
+MAX_KW_DENSITY = _THRESHOLDS.get("max_keyword_density", 0.45)
+
+# Generic phrases to reject (from content rules)
+_GENERIC_PHRASES = set(
+    _RULES.get("content_rejection_rules", {})
+          .get("generic_phrases", {})
+          .get("detect", [])
+)
+_BOILERPLATE = set(
+    _RULES.get("content_rejection_rules", {})
+          .get("boilerplate_text", {})
+          .get("detect", [])
 )
 
-logger = logging.getLogger(__name__)
 
-# ── Section heading detection ─────────────────────────────────────────────────
-_SECTION_HEADINGS = {
-    "experience", "work experience", "employment", "professional experience",
-    "education", "educational history", "academic background",
-    "skills", "skill", "expertise", "technical skills",
-    "summary", "about me", "profile", "objective",
-    "projects", "certifications", "certification", "awards",
-    "languages", "language", "references", "contact", "links",
-}
+# ── Block / Section types ─────────────────────────────────────────────────────
 
-_HEADING_RE = re.compile(
-    r"^(" + "|".join(re.escape(h) for h in _SECTION_HEADINGS) + r")\s*:?\s*$",
-    re.IGNORECASE,
-)
-
-# ── Generic / filler phrases ──────────────────────────────────────────────────
-_GENERIC_PHRASES = {
-    "hardworking", "passionate", "enthusiastic", "self-motivated",
-    "team player", "go-getter", "results-driven", "dynamic",
-    "detail-oriented", "proactive", "fast learner",
-}
-
-# ── Boilerplate patterns ──────────────────────────────────────────────────────
-_BOILERPLATE_RE = re.compile(
-    r"(gdpr|privacy notice|confidential|template|this resume|this cv"
-    r"|all rights reserved|©|copyright)",
-    re.IGNORECASE,
-)
-
-# ── Broken word pattern (spaced letters: E X P E R) ─────────────────────────
-_BROKEN_WORD_RE = re.compile(r"\b([A-Z]\s){3,}[A-Z]\b")
-
-# ── Random characters (>40% non-alphanumeric) ────────────────────────────────
-_RANDOM_CHAR_RE = re.compile(r"[^\w\s,.;:()\-–—'\"/]")
+@dataclass
+class TextBlock:
+    """One atomic text element from the ingester."""
+    text:       str
+    x0:         float
+    y0:         float
+    x1:         float
+    y1:         float
+    page_num:   int
+    confidence: float = 1.0    # OCR confidence (1.0 for native PDF text)
+    block_type: str   = "text" # text | image | table | shape
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Public API
-# ══════════════════════════════════════════════════════════════════════════════
+@dataclass
+class GatekeeperSection:
+    """Result of processing one text block through all rules."""
+    original_text:  str
+    cleaned_text:   str                             # empty if rejected
+    accepted:       bool
+    rule_hits:      list[GatekeeperRuleHit] = field(default_factory=list)
+    block_index:    int = 0
 
-def pages_to_sections(pages: list[IngestedPage]) -> dict[str, list[IngestedBlock]]:
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def pages_to_sections(blocks: list[TextBlock]) -> list[list[TextBlock]]:
+    """Group flat block list into pages (by page_num)."""
+    pages: dict[int, list[TextBlock]] = {}
+    for b in blocks:
+        pages.setdefault(b.page_num, []).append(b)
+    return [pages[p] for p in sorted(pages)]
+
+
+def compute_signals(blocks: list[TextBlock]) -> PageSignals:
     """
-    Split ingested blocks into named sections by detecting heading lines.
-    Returns {section_name_upper: [blocks]}.
+    Compute all detection signals for one page's blocks.
+    Signal names match the JSON keys in rejection_rules.json.
     """
-    sections: dict[str, list[IngestedBlock]] = defaultdict(list)
-    current = "HEADER"
-
-    all_blocks = [b for p in sorted(pages, key=lambda p: p.page_number)
-                  for b in p.blocks]
-
-    for block in all_blocks:
-        if _is_heading(block):
-            current = block.text.strip().upper()
-        else:
-            sections[current].append(block)
-
-    return dict(sections)
-
-
-def compute_signals(page: IngestedPage) -> LayoutSignals:
-    """
-    Compute LayoutSignals for one page.
-    These signals are what the gatekeeper rules check against.
-    """
-    signals = LayoutSignals(page_number=page.page_number)
-    blocks  = sorted(page.blocks, key=lambda b: b.y0)
-
     if not blocks:
-        return signals
+        return PageSignals()
 
-    # ── Irregular line order (y-regression) ──────────────────────────────────
-    prev_y = blocks[0].y0
-    for b in blocks[1:]:
-        if b.y0 < prev_y - 10:   # more than 10 px above previous
-            signals.irregular_line_order = True
-            break
-        prev_y = b.y0
+    texts      = [b.text for b in blocks if b.block_type == "text"]
+    all_text   = " ".join(texts)
+    chars_raw  = all_text.replace(" ", "").replace("\n", "")
+    conf_avg   = sum(b.confidence for b in blocks) / len(blocks)
 
-    # ── X-axis jump (multi-column signal) ────────────────────────────────────
-    if len(blocks) >= 3:
-        x_positions = [b.x0 for b in blocks]
-        median_x    = sorted(x_positions)[len(x_positions) // 2]
-        jumps = [abs(b.x0 - median_x) > 200 for b in blocks]
-        if sum(jumps) > len(blocks) * 0.3:
-            signals.x_axis_jump = True
-
-    signals.is_multi_column = signals.irregular_line_order or signals.x_axis_jump
-
-    # ── Repeated lines ────────────────────────────────────────────────────────
-    text_counts: dict[str, int] = defaultdict(int)
-    for b in blocks:
-        if b.text.strip():
-            text_counts[b.text.strip()] += 1
-    signals.repeated_lines = [t for t, c in text_counts.items() if c > 1]
-
-    # ── Broken words ──────────────────────────────────────────────────────────
-    for b in blocks:
-        if _BROKEN_WORD_RE.search(b.text):
-            signals.broken_words.append(b.block_id)
-
-    # ── Random characters ─────────────────────────────────────────────────────
-    for b in blocks:
-        if b.text:
-            noise = len(_RANDOM_CHAR_RE.findall(b.text))
-            if noise / max(len(b.text), 1) > 0.40:
-                signals.random_characters.append(b.block_id)
-
-    # ── Low OCR confidence ────────────────────────────────────────────────────
-    for b in blocks:
-        if b.confidence < OCR_CONFIDENCE_THRESHOLD:
-            signals.low_confidence_blocks.append(b.block_id)
-
-    # ── Skill meters (visual indicators without text) ─────────────────────────
-    signals.has_skill_meters = any(
-        b.block_type == "image" and not b.text.strip()
-        for b in blocks
+    # Garble ratio: fraction of non-printable / PUA characters
+    bad = sum(
+        1 for ch in all_text
+        if unicodedata.category(ch) in ("Cc", "Cs", "Co") or ord(ch) > 0xE000
     )
+    garble = bad / max(len(all_text), 1)
 
-    return signals
+    # Broken words: E X P E R pattern
+    broken = bool(re.search(r"\b([A-Z] ){3,}", all_text))
+
+    # Random characters: high density of symbols
+    symbol_count = sum(1 for ch in all_text if not ch.isalnum() and not ch.isspace())
+    random_chars = (symbol_count / max(len(all_text), 1)) > 0.35
+
+    # Repeated lines
+    seen: dict[str, int] = {}
+    for t in texts:
+        key = t.strip().lower()[:60]
+        seen[key] = seen.get(key, 0) + 1
+    repeated = any(v >= 3 for v in seen.values())
+
+    # Irregular line order: y positions not monotonically increasing
+    y_positions = [b.y0 for b in blocks if b.block_type == "text"]
+    irregular = sum(
+        1 for i in range(1, len(y_positions))
+        if y_positions[i] < y_positions[i - 1] - 5
+    ) > max(len(y_positions) * 0.15, 2)
+
+    # X-axis jumps: large horizontal shifts
+    x_positions = [b.x0 for b in blocks if b.block_type == "text"]
+    x_jumps = sum(
+        1 for i in range(1, len(x_positions))
+        if abs(x_positions[i] - x_positions[i - 1]) > 200
+    )
+    x_axis_jump = x_jumps > max(len(x_positions) * 0.20, 2)
+
+    # Multi-column heuristic
+    unique_x = set(round(b.x0 / 50) * 50 for b in blocks if b.block_type == "text")
+    multi_col = len(unique_x) >= 3
+
+    # Table structure
+    has_table = any(b.block_type == "table" for b in blocks)
+
+    # Skill meters
+    meter_re = re.compile(r"[★☆●○◉◎█▓░▒■□▪▫✦✧◆◇]{3,}")
+    has_meters = bool(meter_re.search(all_text))
+
+    return PageSignals(
+        irregular_line_order = irregular,
+        x_axis_jump          = x_axis_jump,
+        repeated_lines       = repeated,
+        broken_words         = broken,
+        random_characters    = random_chars,
+        low_confidence_score = conf_avg < OCR_MIN_CONF,
+        no_text_layer        = len(chars_raw) < MIN_TEXT_CHARS,
+        image_only_pdf       = all(b.block_type == "image" for b in blocks),
+        multi_column         = multi_col,
+        has_table_structure  = has_table,
+        has_skill_meters     = has_meters,
+        ocr_confidence_avg   = round(conf_avg, 3),
+        garble_ratio         = round(garble, 4),
+        char_count           = len(chars_raw),
+    )
 
 
 def apply_rules(
-    pages: list[IngestedPage],
-    rules: dict | None = None,
-) -> GatekeeperResult:
+    blocks:  list[TextBlock],
+    signals: PageSignals,
+) -> list[GatekeeperSection]:
     """
-    Run all four rule categories against the ingested pages.
-    Returns a GatekeeperResult with:
-      • rule_hits:          every fired rule
-      • rejected_block_ids: set of block_ids to exclude from further processing
-      • flagged_pages:      page numbers needing human review
-      • clean_blocks:       blocks that passed all rules
+    Apply all 4 rule categories to each block on a page.
+
+    Returns a GatekeeperSection per block with:
+      - accepted=True  → cleaned_text is usable
+      - accepted=False → cleaned_text="" (block rejected)
     """
-    if rules is None:
-        rules = REJECTION_RULES
+    sections: list[GatekeeperSection] = []
 
-    result = GatekeeperResult()
+    for idx, block in enumerate(blocks):
+        hits:    list[GatekeeperRuleHit] = []
+        text     = block.text
+        accepted = True
 
-    for page in pages:
-        signals     = compute_signals(page)
-        page_hits   = []
-
-        # ── LAYOUT RULES ──────────────────────────────────────────────────────
-        page_hits += _check_layout(page, signals, rules)
-
-        # ── VISUAL RULES ──────────────────────────────────────────────────────
-        page_hits += _check_visual(page, signals, rules)
-
-        # ── SOURCE / OCR QUALITY RULES ────────────────────────────────────────
-        page_hits += _check_source(page, signals, rules)
-
-        # ── CONTENT RULES ─────────────────────────────────────────────────────
-        page_hits += _check_content(page, rules)
-
-        result.rule_hits.extend(page_hits)
-
-        # Collect rejected block IDs
-        for hit in page_hits:
-            if hit.action in (GatekeeperAction.REJECT, GatekeeperAction.DEDUP):
-                if hit.block_id:
-                    result.rejected_block_ids.add(hit.block_id)
-            if hit.action == GatekeeperAction.FLAG:
-                result.flagged_pages.append(page.page_number)
-
-    # Build clean_blocks (everything not rejected)
-    all_blocks = [b for p in pages for b in p.blocks]
-    result.clean_blocks = [
-        b for b in all_blocks
-        if b.block_id not in result.rejected_block_ids
-        and b.text.strip()
-    ]
-
-    logger.info(
-        "Gatekeeper: %d rule hits | %d rejected | %d clean blocks | %d flagged pages",
-        len(result.rule_hits), len(result.rejected_block_ids),
-        len(result.clean_blocks), len(set(result.flagged_pages)),
-    )
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Rule category checkers
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _check_layout(
-    page: IngestedPage,
-    signals: LayoutSignals,
-    rules: dict,
-) -> list[GatekeeperRuleHit]:
-    hits: list[GatekeeperRuleHit] = []
-    layout = rules.get("layout_rejection_rules", {})
-
-    # Multi-column layout
-    if signals.is_multi_column:
-        affected = [b.block_id for b in page.blocks]
-        for bid in affected:
+        # ── SOURCE QUALITY RULES ──────────────────────────────────────────
+        if signals.low_confidence_score and block.confidence < OCR_MIN_CONF:
             hits.append(GatekeeperRuleHit(
-                rule_category = "layout",
-                rule_name     = "multi_column_layout",
-                reason        = layout["multi_column_layout"]["description"],
-                action        = GatekeeperAction.REJECT,
-                block_id      = bid,
-                page_number   = page.page_number,
+                rule_name   = "low_quality_ocr",
+                category    = RuleCategory.SOURCE,
+                action      = RuleAction.REJECT,
+                reason      = f"OCR confidence {block.confidence:.2f} < {OCR_MIN_CONF}",
+                block_index = idx,
+                confidence  = block.confidence,
             ))
+            accepted = False
 
-    # Tables
-    for block in page.blocks:
-        if block.block_type == "table":
+        if signals.garble_ratio > GARBLE_MAX:
             hits.append(GatekeeperRuleHit(
-                rule_category = "layout",
-                rule_name     = "tables_and_textboxes",
-                reason        = layout.get("tables_and_textboxes", {}).get(
-                    "description", "Table content ignored"),
-                action        = GatekeeperAction.IGNORE,
-                block_id      = block.block_id,
-                page_number   = page.page_number,
+                rule_name   = "non_text_layers",
+                category    = RuleCategory.SOURCE,
+                action      = RuleAction.FLAG,
+                reason      = f"Garble ratio {signals.garble_ratio:.2%} > {GARBLE_MAX:.0%}",
+                block_index = idx,
             ))
+            # Flag but don't immediately reject — let downstream decide
 
-    # Repeated lines (headers/footers)
-    repeated_texts = set(signals.repeated_lines)
-    for block in page.blocks:
-        if block.text.strip() in repeated_texts:
+        # ── LAYOUT RULES ──────────────────────────────────────────────────
+        if signals.multi_column and (signals.irregular_line_order or signals.x_axis_jump):
             hits.append(GatekeeperRuleHit(
-                rule_category = "layout",
-                rule_name     = "headers_footers",
-                reason        = "Repeated line detected across pages — likely header/footer",
-                action        = GatekeeperAction.DEDUP,
-                block_id      = block.block_id,
-                page_number   = page.page_number,
+                rule_name   = "multi_column_layout",
+                category    = RuleCategory.LAYOUT,
+                action      = RuleAction.REJECT,
+                reason      = "Multi-column with irregular line order / x-axis jumps",
+                block_index = idx,
             ))
+            accepted = False
 
-    return hits
-
-
-def _check_visual(
-    page: IngestedPage,
-    signals: LayoutSignals,
-    rules: dict,
-) -> list[GatekeeperRuleHit]:
-    hits: list[GatekeeperRuleHit] = []
-
-    for block in page.blocks:
-        # Image blocks without OCR text
-        if block.block_type == "image" and not block.text.strip():
+        if signals.repeated_lines and _is_header_footer(text):
             hits.append(GatekeeperRuleHit(
-                rule_category = "visual",
-                rule_name     = "image_only_elements",
-                reason        = "Image block with no extractable text (logo / badge / photo)",
-                action        = GatekeeperAction.IGNORE,
-                block_id      = block.block_id,
-                page_number   = page.page_number,
+                rule_name   = "headers_footers",
+                category    = RuleCategory.LAYOUT,
+                action      = RuleAction.DEDUP,
+                reason      = "Repeated header/footer line detected",
+                block_index = idx,
             ))
+            accepted = False
 
-        # Skill meters — text that describes a visual meter with no numeric context
-        if _is_skill_meter_text(block.text):
+        if signals.has_table_structure and block.block_type == "table":
             hits.append(GatekeeperRuleHit(
-                rule_category = "visual",
-                rule_name     = "skill_meters",
-                reason        = "Skill meter descriptor without numeric/label context",
-                action        = GatekeeperAction.REJECT,
-                block_id      = block.block_id,
-                page_number   = page.page_number,
+                rule_name   = "tables_and_textboxes",
+                category    = RuleCategory.LAYOUT,
+                action      = RuleAction.IGNORE,
+                reason      = "Table/textbox structure — content ignored",
+                block_index = idx,
             ))
+            accepted = False
 
-    return hits
+        # ── VISUAL RULES ──────────────────────────────────────────────────
+        if block.block_type == "image" and len(text.strip()) < 5:
+            hits.append(GatekeeperRuleHit(
+                rule_name   = "image_only_elements",
+                category    = RuleCategory.VISUAL,
+                action      = RuleAction.IGNORE,
+                reason      = "Image/logo/badge with no OCR text",
+                block_index = idx,
+            ))
+            accepted = False
 
+        if signals.has_skill_meters and _is_skill_meter_block(text):
+            hits.append(GatekeeperRuleHit(
+                rule_name   = "skill_meters",
+                category    = RuleCategory.VISUAL,
+                action      = RuleAction.REJECT,
+                reason      = "Skill bar/star/circle without text context — visual only",
+                block_index = idx,
+            ))
+            text     = _strip_visual_chars(text)   # keep any text part
+            accepted = len(text.strip()) > 3
 
-def _check_source(
-    page: IngestedPage,
-    signals: LayoutSignals,
-    rules: dict,
-) -> list[GatekeeperRuleHit]:
-    hits: list[GatekeeperRuleHit] = []
-    source = rules.get("source_quality_rules", {})
+        # ── CONTENT RULES ─────────────────────────────────────────────────
+        if _is_boilerplate(text):
+            hits.append(GatekeeperRuleHit(
+                rule_name   = "boilerplate_text",
+                category    = RuleCategory.CONTENT,
+                action      = RuleAction.IGNORE,
+                reason      = "Legal / privacy / template boilerplate",
+                block_index = idx,
+            ))
+            accepted = False
 
-    # Low OCR confidence blocks
-    for bid in signals.low_confidence_blocks:
-        hits.append(GatekeeperRuleHit(
-            rule_category = "source",
-            rule_name     = "low_quality_ocr",
-            reason        = f"OCR confidence below {OCR_CONFIDENCE_THRESHOLD:.0%}",
-            action        = GatekeeperAction.REJECT,
-            block_id      = bid,
-            page_number   = page.page_number,
+        if _is_pure_generic(text):
+            hits.append(GatekeeperRuleHit(
+                rule_name   = "generic_phrases",
+                category    = RuleCategory.CONTENT,
+                action      = RuleAction.REJECT,
+                reason      = "Generic phrase with no supporting context",
+                block_index = idx,
+            ))
+            accepted = False
+
+        if _is_keyword_stuffed(text):
+            hits.append(GatekeeperRuleHit(
+                rule_name   = "keyword_stuffing",
+                category    = RuleCategory.CONTENT,
+                action      = RuleAction.REJECT,
+                reason      = "Comma-separated skill dump / no structure",
+                block_index = idx,
+            ))
+            accepted = False
+
+        # ── Broken word repair ────────────────────────────────────────────
+        if signals.broken_words:
+            text = _repair_broken_words(text)
+
+        sections.append(GatekeeperSection(
+            original_text = block.text,
+            cleaned_text  = text.strip() if accepted else "",
+            accepted      = accepted,
+            rule_hits     = hits,
+            block_index   = idx,
         ))
 
-    # Broken words
-    for bid in signals.broken_words:
-        hits.append(GatekeeperRuleHit(
-            rule_category = "source",
-            rule_name     = "low_quality_ocr",
-            reason        = "Broken word pattern detected (spaced characters)",
-            action        = GatekeeperAction.REJECT,
-            block_id      = bid,
-            page_number   = page.page_number,
-        ))
-
-    # Random characters
-    for bid in signals.random_characters:
-        hits.append(GatekeeperRuleHit(
-            rule_category = "source",
-            rule_name     = "non_text_layers",
-            reason        = "Block contains >40% non-alphanumeric characters",
-            action        = GatekeeperAction.REJECT,
-            block_id      = bid,
-            page_number   = page.page_number,
-        ))
-
-    return hits
-
-
-def _check_content(
-    page: IngestedPage,
-    rules: dict,
-) -> list[GatekeeperRuleHit]:
-    hits: list[GatekeeperRuleHit] = []
-    content = rules.get("content_rejection_rules", {})
-    kw_threshold = content.get("keyword_stuffing", {}).get("threshold", 25)
-
-    for block in page.blocks:
-        text_lower = block.text.lower()
-
-        # Boilerplate / legal text
-        if _BOILERPLATE_RE.search(text_lower):
-            hits.append(GatekeeperRuleHit(
-                rule_category = "content",
-                rule_name     = "boilerplate_text",
-                reason        = "Legal disclaimer / privacy notice / template text",
-                action        = GatekeeperAction.IGNORE,
-                block_id      = block.block_id,
-                page_number   = page.page_number,
-            ))
-            continue
-
-        # Generic phrases without supporting context
-        if _is_pure_generic(block.text):
-            hits.append(GatekeeperRuleHit(
-                rule_category = "content",
-                rule_name     = "generic_phrases",
-                reason        = "Filler adjective with no supporting evidence",
-                action        = GatekeeperAction.REJECT,
-                block_id      = block.block_id,
-                page_number   = page.page_number,
-            ))
-            continue
-
-        # Keyword stuffing
-        comma_count = block.text.count(",")
-        word_count  = len(block.text.split())
-        if comma_count > kw_threshold and word_count < comma_count * 2:
-            hits.append(GatekeeperRuleHit(
-                rule_category = "content",
-                rule_name     = "keyword_stuffing",
-                reason        = f"Flat keyword list: {comma_count} commas, {word_count} words",
-                action        = GatekeeperAction.REJECT,
-                block_id      = block.block_id,
-                page_number   = page.page_number,
-            ))
-
-    return hits
+    return sections
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _is_heading(block: IngestedBlock) -> bool:
-    text = block.text.strip()
-    if block.block_type == "heading":
-        return True
-    if len(text) > 60:
+_VISUAL_CHARS_RE = re.compile(r"[★☆●○◉◎█▓░▒■□▪▫✦✧◆◇→←↑↓►◄▸▹]{2,}")
+_HEADER_PATTERNS = re.compile(
+    r"^(page\s*\d+|\d+\s*/\s*\d+|confidential|curriculum\s+vitae|resume|cv)$",
+    re.IGNORECASE,
+)
+_METER_RE = re.compile(r"[★☆●○◉█▓░▒■□▪▫]{3,}")
+
+
+def _is_header_footer(text: str) -> bool:
+    return bool(_HEADER_PATTERNS.match(text.strip()))
+
+
+def _is_skill_meter_block(text: str) -> bool:
+    """True when >40% of chars are visual meter symbols."""
+    if not text:
         return False
-    return bool(_HEADING_RE.match(text))
+    meter_chars = sum(1 for ch in text if ch in "★☆●○◉◎█▓░▒■□▪▫✦✧◆◇")
+    return (meter_chars / len(text)) > 0.40
 
 
-def _is_skill_meter_text(text: str) -> bool:
-    """Detect text that is purely describing a visual meter (no numeric/label)."""
-    patterns = [r"^\s*ring\s*$", r"^\s*circle\s*$", r"^\s*\d+\s*stars?\s*$",
-                r"^[█▓▒░●○◉◎■□▪▫★☆]+\s*$"]
-    for p in patterns:
-        if re.match(p, text.strip(), re.IGNORECASE):
-            return True
-    return False
+def _strip_visual_chars(text: str) -> str:
+    return _VISUAL_CHARS_RE.sub(" ", text).strip()
+
+
+def _is_boilerplate(text: str) -> bool:
+    lower = text.lower().strip()
+    return any(phrase in lower for phrase in _BOILERPLATE)
 
 
 def _is_pure_generic(text: str) -> bool:
-    """True only when the entire block is a generic phrase with no other content."""
-    words = set(re.findall(r"[a-zA-Z]+", text.lower()))
-    if not words:
+    """
+    True if the entire block is one or more generic phrases
+    with no supporting technical or contextual content.
+    """
+    lower = text.lower()
+    words = set(re.findall(r"\b\w+\b", lower))
+    technical_words = {
+        "python", "java", "sql", "api", "aws", "docker", "kubernetes",
+        "react", "node", "django", "flask", "tensorflow", "pytorch",
+        "managed", "led", "built", "designed", "developed", "implemented",
+        "increased", "reduced", "achieved", "delivered", "launched",
+    }
+    has_context = bool(words & technical_words)
+    all_generic = all(
+        any(phrase in lower for phrase in _GENERIC_PHRASES)
+        for phrase in _GENERIC_PHRASES
+        if phrase in lower
+    )
+    generic_hit = any(phrase in lower for phrase in _GENERIC_PHRASES)
+    return generic_hit and not has_context and len(words) < 12
+
+
+def _is_keyword_stuffed(text: str) -> bool:
+    """
+    True when text is a comma-separated list with >30 tokens and no sentences.
+    """
+    tokens = [t.strip() for t in text.split(",") if t.strip()]
+    if len(tokens) < int(_RULES.get("content_rejection_rules", {})
+                              .get("keyword_stuffing", {})
+                              .get("threshold_tokens", 30)):
         return False
-    non_generic = words - _GENERIC_PHRASES
-    # If >80% of words are generic filler AND there's no supporting content signal
-    generic_ratio = 1 - (len(non_generic) / max(len(words), 1))
-    return generic_ratio > 0.80 and len(words) <= 6
+    # Check: is there any sentence structure?
+    sentence_re = re.compile(r"[A-Z][^.!?]{10,}[.!?]")
+    return not bool(sentence_re.search(text))
+
+
+def _repair_broken_words(text: str) -> str:
+    """
+    Fix 'E X P E R I E N C E' → 'EXPERIENCE'.
+    Pattern: single uppercase letters separated by spaces.
+    """
+    return re.sub(r"\b([A-Z] ){2,}([A-Z])\b",
+                  lambda m: m.group(0).replace(" ", ""),
+                  text)

@@ -1,126 +1,124 @@
 """
 doc_pipeline/parse_pipeline/storage/db_client.py
 =================================================
-SQLite resumes.db client.
+SQLite persistence for parsed resumes.
 
-Two JSON columns per resume row:
-  masked_json  — PII removed; used for embedding, matching, display
-  pii_json     — original PII preserved; should be encrypted at rest
+Two JSON blobs per resume:
+  masked_json  — PII replaced with placeholders ([NAME], [EMAIL], …)
+                 Safe to pass to Project 3 / 4 matching and ranking.
+  pii_json     — Full data including name/email/phone.
+                 Restricted access — Project 2 ORM controls who can read it.
 
-Also stores gatekeeper_hits as a JSON column for audit.
+Tables
+------
+  resumes   (id, external_id, masked_json, pii_json, created_at, ocr_used, page_count)
 """
 from __future__ import annotations
+
 import json
+import logging
 import sqlite3
-import threading
-from contextlib import contextmanager
-from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
-from ..config import DB_PATH
+from doc_pipeline.parse_pipeline.config import DATA_DIR
+from doc_pipeline.parse_pipeline.serialization.schema import ResumeDocument
 
-_local = threading.local()
+logger = logging.getLogger("parse_pipeline.db")
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS resumes (
-    id              TEXT PRIMARY KEY,
-    external_id     TEXT,
-    filename        TEXT,
-    masked_json     TEXT NOT NULL,
-    pii_json        TEXT NOT NULL,
-    gatekeeper_json TEXT,
-    ocr_used        INTEGER DEFAULT 0,
-    quality         TEXT,
-    created_at      TEXT DEFAULT (datetime('now')),
-    updated_at      TEXT DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_resumes_external ON resumes(external_id);
-CREATE INDEX IF NOT EXISTS idx_resumes_created  ON resumes(created_at);
-"""
+DB_PATH = DATA_DIR / "resumes.db"
 
 
-def _conn() -> sqlite3.Connection:
-    if not hasattr(_local, "conn") or _local.conn is None:
-        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False,
-                               detect_types=sqlite3.PARSE_DECLTYPES, timeout=30)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        _local.conn = conn
-    return _local.conn
+def _get_conn() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
 
-@contextmanager
-def get_db():
-    conn = _conn()
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-
-
-def init_db() -> None:
-    with get_db() as conn:
-        conn.executescript(_SCHEMA)
-
-
-def upsert_resume(
-    resume_id:       str,
-    masked_document: dict,
-    pii_document:    dict,
-    gatekeeper_hits: list,
-    ocr_used:        bool = False,
-    quality:         str  = "normal",
-    external_id:     str  = "",
-    filename:        str  = "",
-) -> None:
-    with get_db() as conn:
+def _init_tables() -> None:
+    with _get_conn() as conn:
         conn.execute("""
-            INSERT INTO resumes
-              (id, external_id, filename, masked_json, pii_json, gatekeeper_json,
-               ocr_used, quality, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(id) DO UPDATE SET
-              masked_json     = excluded.masked_json,
-              pii_json        = excluded.pii_json,
-              gatekeeper_json = excluded.gatekeeper_json,
-              ocr_used        = excluded.ocr_used,
-              quality         = excluded.quality,
-              updated_at      = excluded.updated_at
+            CREATE TABLE IF NOT EXISTS resumes (
+                id           TEXT PRIMARY KEY,
+                external_id  TEXT,
+                masked_json  TEXT NOT NULL,
+                pii_json     TEXT NOT NULL,
+                created_at   TEXT DEFAULT (datetime('now')),
+                ocr_used     INTEGER DEFAULT 0,
+                page_count   INTEGER DEFAULT 0,
+                total_years  REAL DEFAULT 0.0,
+                status       TEXT DEFAULT 'complete'
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_resumes_ext ON resumes(external_id)")
+    logger.debug("SQLite tables ready at %s", DB_PATH)
+
+
+# Initialise on import
+_init_tables()
+
+
+def store_resume(
+    resume_doc: ResumeDocument,
+    raw_text_for_vector: str = "",
+) -> tuple[Path, Path]:
+    """
+    Persist a ResumeDocument to SQLite.
+
+    Writes:
+      data/masked/<resume_id>.json  — PII-safe version
+      data/pii/<resume_id>.json     — full PII version
+
+    Returns (masked_path, pii_path).
+    """
+    masked_dir = DATA_DIR / "masked"
+    pii_dir    = DATA_DIR / "pii"
+    masked_dir.mkdir(parents=True, exist_ok=True)
+    pii_dir.mkdir(parents=True, exist_ok=True)
+
+    masked_data = resume_doc.to_masked_dict()
+    pii_data    = resume_doc.to_pii_dict()
+
+    masked_path = masked_dir / f"{resume_doc.resume_id}.json"
+    pii_path    = pii_dir    / f"{resume_doc.resume_id}.json"
+
+    masked_path.write_text(json.dumps(masked_data, indent=2, default=str), encoding="utf-8")
+    pii_path.write_text(   json.dumps(pii_data,    indent=2, default=str), encoding="utf-8")
+
+    with _get_conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO resumes
+              (id, external_id, masked_json, pii_json, ocr_used, page_count, total_years)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
-            resume_id, external_id, filename,
-            json.dumps(masked_document, default=str),
-            json.dumps(pii_document,    default=str),
-            json.dumps(gatekeeper_hits, default=str),
-            int(ocr_used), quality,
-            datetime.utcnow().isoformat(),
+            resume_doc.resume_id,
+            resume_doc.external_id,
+            json.dumps(masked_data, default=str),
+            json.dumps(pii_data,    default=str),
+            int(resume_doc.ocr_used),
+            resume_doc.page_count,
+            resume_doc.total_years_exp,
         ))
 
-
-def fetch_resume(resume_id: str) -> dict | None:
-    conn = _conn()
-    row  = conn.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,)).fetchone()
-    if not row:
-        return None
-    return {
-        "id":           row["id"],
-        "external_id":  row["external_id"],
-        "masked":       json.loads(row["masked_json"]),
-        "pii":          json.loads(row["pii_json"]),
-        "gatekeeper":   json.loads(row["gatekeeper_json"] or "[]"),
-        "ocr_used":     bool(row["ocr_used"]),
-        "quality":      row["quality"],
-        "created_at":   row["created_at"],
-    }
+    logger.info("Stored resume %s (masked=%s)", resume_doc.resume_id, masked_path.name)
+    return masked_path, pii_path
 
 
-def list_resumes(limit: int = 100, offset: int = 0) -> list[dict]:
-    conn = _conn()
-    rows = conn.execute(
-        "SELECT id, external_id, filename, quality, ocr_used, created_at "
-        "FROM resumes ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        (limit, offset),
-    ).fetchall()
-    return [dict(r) for r in rows]
+def load_masked(resume_id: str) -> Optional[dict]:
+    """Load the masked (PII-safe) resume dict from SQLite."""
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT masked_json FROM resumes WHERE id = ?", (resume_id,)
+        ).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def load_pii(resume_id: str) -> Optional[dict]:
+    """Load the full PII resume dict from SQLite. Restrict to authorised callers."""
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT pii_json FROM resumes WHERE id = ?", (resume_id,)
+        ).fetchone()
+    return json.loads(row[0]) if row else None

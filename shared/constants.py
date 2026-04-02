@@ -1,108 +1,81 @@
 """
 shared/constants.py
 ===================
-Shared enums, band names, and status constants used across all 4 projects.
-Single source of truth — never redefine in individual projects.
+Single source of truth for all shared enums, band names, pipeline statuses,
+and constants used across all four projects.
+
+Import pattern:
+    from shared.constants import CandidateBand, PipelineStatus, ResumeType
 """
 from __future__ import annotations
 from enum import Enum
 
 
-class Band(str, Enum):
+class CandidateBand(str, Enum):
     GOLD     = "gold"
     SILVER   = "silver"
     BRONZE   = "bronze"
     REJECTED = "rejected"
-    PENDING  = "pending"
+
+
+class PipelineStatus(str, Enum):
+    PENDING   = "pending"
+    RUNNING   = "running"
+    COMPLETE  = "complete"
+    FAILED    = "failed"
+    FLAGGED   = "flagged"
 
 
 class ResumeType(str, Enum):
-    SOFTWARE_ENGINEER = "software_engineer"
-    DATA_ENGINEER     = "data_engineer"
-    DESIGNER          = "designer"
-    PRODUCT_MANAGER   = "product_manager"
-    SALES             = "sales"
-    MARKETING         = "marketing"
-    HR                = "hr"
-    FINANCE           = "finance"
-    UNKNOWN           = "unknown"
+    FRESH_GRAD    = "fresh_grad"
+    MID_LEVEL     = "mid_level"
+    SENIOR        = "senior"
+    EXECUTIVE     = "executive"
+    CAREER_CHANGE = "career_change"
 
 
 class PageQuality(str, Enum):
     NORMAL     = "normal"
     PIXEL_ONLY = "pixel_only"
     GARBLED    = "garbled"
-    LOW_OCR    = "low_ocr"
+    REJECTED   = "rejected"
 
 
-class GatekeeperAction(str, Enum):
-    PASS    = "pass"
-    IGNORE  = "ignore"
-    REJECT  = "reject"
-    FLAG    = "flag"
-    DEDUP   = "deduplicate"
+class RuleCategory(str, Enum):
+    LAYOUT  = "layout"
+    VISUAL  = "visual"
+    CONTENT = "content"
+    SOURCE  = "source"
 
 
-class ApplicationStatus(str, Enum):
-    PENDING     = "pending"
-    PARSING     = "parsing"
-    PARSED      = "parsed"
-    SCORED      = "scored"
-    RANKED      = "ranked"
-    SHORTLISTED = "shortlisted"
-    REJECTED    = "rejected"
-    ON_HOLD     = "on_hold"
+class RuleAction(str, Enum):
+    IGNORE = "ignored"
+    REJECT = "rejected"
+    FLAG   = "flagged"
+    CLEAN  = "clean"
+    DEDUP  = "deduplicate"
 
 
-class SectionName(str, Enum):
-    CONTACT        = "contact"
-    SUMMARY        = "summary"
-    EXPERIENCE     = "experience"
-    EDUCATION      = "education"
-    SKILLS         = "skills"
-    PROJECTS       = "projects"
-    CERTIFICATIONS = "certifications"
-    LANGUAGES      = "languages"
-    AWARDS         = "awards"
-    REFERENCES     = "references"
-    LINKS          = "links"
-    UNKNOWN        = "unknown"
+# Redis queue names
+REDIS_QUEUE_CANDIDATES = "slam:queue:candidates"
+REDIS_QUEUE_REPORTS    = "slam:queue:reports"
+REDIS_QUEUE_GOLD       = "queue:gold"
+REDIS_QUEUE_SILVER     = "queue:silver"
+REDIS_QUEUE_BRONZE     = "queue:bronze"
+REDIS_QUEUE_REVIEW     = "queue:review"
 
-
-# ── Band upgrade matrix ───────────────────────────────────────────────────────
-# (current_band, new_band) → resulting_band
-# Gold is sticky — never downgraded. Silver protected from Bronze/Rejected.
-
-BAND_UPDATE_RULES: dict[tuple[str, str], str] = {
-    (Band.GOLD,     Band.GOLD):     Band.GOLD,
-    (Band.SILVER,   Band.GOLD):     Band.GOLD,
-    (Band.BRONZE,   Band.GOLD):     Band.GOLD,
-    (Band.REJECTED, Band.GOLD):     Band.GOLD,
-    (Band.PENDING,  Band.GOLD):     Band.GOLD,
-    (Band.GOLD,     Band.SILVER):   Band.GOLD,    # gold protected
-    (Band.SILVER,   Band.SILVER):   Band.SILVER,
-    (Band.BRONZE,   Band.SILVER):   Band.SILVER,
-    (Band.REJECTED, Band.SILVER):   Band.SILVER,
-    (Band.PENDING,  Band.SILVER):   Band.SILVER,
-    (Band.GOLD,     Band.BRONZE):   Band.GOLD,    # gold protected
-    (Band.SILVER,   Band.BRONZE):   Band.SILVER,  # silver protected
-    (Band.BRONZE,   Band.BRONZE):   Band.BRONZE,
-    (Band.REJECTED, Band.BRONZE):   Band.BRONZE,
-    (Band.PENDING,  Band.BRONZE):   Band.BRONZE,
-    (Band.GOLD,     Band.REJECTED): Band.GOLD,
-    (Band.SILVER,   Band.REJECTED): Band.SILVER,
-    (Band.BRONZE,   Band.REJECTED): Band.BRONZE,
-    (Band.REJECTED, Band.REJECTED): Band.REJECTED,
-    (Band.PENDING,  Band.REJECTED): Band.REJECTED,
+# Band update precedence matrix
+# Row = existing band, Col = new band → resulting band
+BAND_UPDATE_MATRIX: dict[str, dict[str, str]] = {
+    "gold":     {"gold": "gold",   "silver": "gold",   "bronze": "gold",   "rejected": "gold"},
+    "silver":   {"gold": "gold",   "silver": "silver", "bronze": "silver", "rejected": "silver"},
+    "bronze":   {"gold": "gold",   "silver": "silver", "bronze": "bronze", "rejected": "bronze"},
+    "rejected": {"gold": "gold",   "silver": "silver", "bronze": "bronze", "rejected": "rejected"},
+    "none":     {"gold": "gold",   "silver": "silver", "bronze": "bronze", "rejected": "rejected"},
 }
 
 
-def resolve_band(current: str, new_band: str) -> str:
-    """Apply the band update matrix — gold and silver are sticky."""
-    key = (Band(current), Band(new_band))
-    return BAND_UPDATE_RULES.get(key, new_band)
-
-
-QUEUE_CANDIDATES = "ats:queue:candidates"
-QUEUE_REPORTS    = "ats:queue:reports"
-QUEUE_REVIEW     = "ats:queue:review"
+def resolve_band_update(existing: str, new_band: str) -> str:
+    """Apply band precedence rules. Gold never downgrades. Silver protects bronze."""
+    row = BAND_UPDATE_MATRIX.get(existing, BAND_UPDATE_MATRIX["none"])
+    return row.get(new_band, existing)

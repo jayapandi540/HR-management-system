@@ -13,7 +13,7 @@
 - JD matching (TF-IDF/cosine), ATS scoring/ranking
 - Redis queues, DuckDB analytics, Chroma vectors
 - FastAPI + React UI (filters/shortlists/feedback)
-- Admin config, audits, returning-candidate detect [perplexity](https://www.perplexity.ai/search/baa8d10c-ce0c-402f-8d52-a32547da9b83)
+- Admin config, audits, returning-candidate detect 
 
 ## 📁 Structure
 ```
@@ -28,7 +28,7 @@ hr_management_system/
 ├── docker-compose.yml
 └── pyproject.toml
 ```
-Monorepo evolves your doc_pipeline/resume_ats/ats_ranker/ats_system. [perplexity](https://www.perplexity.ai/search/6c83f498-a487-4d07-a9aa-757229141f17)
+Monorepo evolves your doc_pipeline/resume_ats/ats_ranker/ats_system.
 
 ## Quickstart
 ```bash
@@ -43,7 +43,7 @@ curl -F "resume=@test.pdf" -F "jd=@job.txt" http://localhost:8000/api/match
 | 1 | Parsing pipeline | PDF→JSON DB save |
 | 2 | Matching/scoring APIs | End-to-end score |
 | 3 | Queues/ranking/feedback | Shortlist + UI |
-| 4 | Analytics/tests/Docker | v1 release [recruitbpm](https://recruitbpm.com/blog/resume-parser-recruiters) |
+| 4 | Analytics/tests/Docker | v1 release |
 
 ## Tech
 - **Backend**: FastAPI/Pydantic/SQLAlchemy
@@ -56,6 +56,3 @@ curl -F "resume=@test.pdf" -F "jd=@job.txt" http://localhost:8000/api/match
 - Model: F1/rank eval on labeled data [47billion](https://47billion.com/blog/rethinking-resume-scoring-how-llms-are-transforming-ats-for-the-ai-generation/)
 
 
-***
-
-Copy-paste this compact Markdown into `README.md`—fits GitHub render, SEO-optimized, prior specs integrated. Want `docker-compose.yml` next? [perplexity](https://www.perplexity.ai/search/f7677702-b5d2-43b5-9179-e682c2663bdd)
